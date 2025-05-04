@@ -1,0 +1,137 @@
+import os
+import gzip
+from Bio import SeqIO
+from Bio.Seq import Seq
+import pandas as pd
+
+# -------------------------------
+# STEP 1: Read DNA Sequences from all .fa.gz chromosome files
+# -------------------------------
+
+def read_fasta_gz(folder_path):
+    genome = {}
+    fasta_files = sorted([f for f in os.listdir(folder_path) if f.endswith('.fa.gz')])
+    
+    for idx, filename in enumerate(fasta_files, start=1):
+        chrom_id = str(idx)  # Use file order as chromosome ID: "1", "2", "3", ...
+        print(f"📄 Found FASTA file: {filename} → Assigned Chromosome ID: {chrom_id}")
+        
+        with gzip.open(os.path.join(folder_path, filename), "rt") as handle:
+            for record in SeqIO.parse(handle, "fasta"):
+                genome[chrom_id] = str(record.seq).upper()
+                print(f"🧬 Loaded sequence for chromosome {chrom_id} (from record {record.id})")
+                
+    print(f"✅ Loaded {len(genome)} chromosomes from FASTA files")
+    print("🔍 Chromosome names in genome:", list(genome.keys()))
+    return genome
+
+genome_folder = "data1/"  # Folder containing .fa.gz files
+genome_data = read_fasta_gz(genome_folder)
+
+# -------------------------------
+# STEP 2: Parse all GFF3 files in a folder
+# -------------------------------
+
+def parse_all_gff3(folder_path):
+    all_genes = []
+    for filename in sorted(os.listdir(folder_path)):
+        if filename.endswith('.gff3'):
+            chrom_id = filename.split('.')[-2].split('chromosome.')[-1]  # Extract chromosome number from filename
+            print(f"📂 Parsing GFF3 file: {filename} → Assigned Chromosome ID: {chrom_id}")
+            file_path = os.path.join(folder_path, filename)
+            with open(file_path, 'r') as file:
+                for line in file:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.strip().split('\t')
+                    if len(parts) != 9:
+                        continue
+                    chrom, _, feature_type, start, end, _, strand, _, attributes = parts
+                    if feature_type == "gene":
+                        gene_id = None
+                        for attr in attributes.split(';'):
+                            if attr.startswith("ID=") or attr.startswith("gene_id=") or "GeneID" in attr:
+                                gene_id = attr.split('=')[-1]
+                                break
+                        if gene_id:
+                            if gene_id.startswith("gene:"):
+                                gene_id = gene_id.replace("gene:", "")
+                            all_genes.append({
+                                'gene_id': gene_id,
+                                'chrom': chrom_id,  # Use chrom_id derived from file name
+                                'start': int(start),
+                                'end': int(end),
+                                'strand': strand
+                            })
+    df = pd.DataFrame(all_genes)
+    print(f"✅ Parsed {len(df)} total genes from all GFF3 files")
+    print("🔍 Unique chromosomes in combined GFF3:", df['chrom'].unique())
+    return df
+
+gff3_folder = "gff3 _files/"  # Folder containing all .gff3 files
+gene_annotations = parse_all_gff3(gff3_folder)
+
+# -------------------------------
+# STEP 3: Read GEO expression data
+# -------------------------------
+
+def read_geo_expression(geo_file):
+    df = pd.read_csv(geo_file, sep='\t')
+    df.rename(columns={df.columns[0]: 'gene_id'}, inplace=True)
+    print(f"✅ Loaded GEO expression data: {df.shape[0]} genes x {df.shape[1]} columns")
+    return df
+
+geo_file = "genes_to_alias_ids.tsv"
+geo_data = read_geo_expression(geo_file)
+
+# -------------------------------
+# STEP 4: Check gene ID intersection
+# -------------------------------
+
+common_gene_ids = set(gene_annotations['gene_id']) & set(geo_data['gene_id'])
+print(f"🔍 Matching gene IDs between GFF3 and GEO: {len(common_gene_ids)}")
+
+# -------------------------------
+# STEP 5: Merge annotations and expression data
+# -------------------------------
+
+merged = pd.merge(gene_annotations, geo_data, on='gene_id')
+print(f"✅ Merged annotations with expression data: {len(merged)} records")
+
+# -------------------------------
+# STEP 6: Add gene DNA sequences to merged data
+# -------------------------------
+
+def extract_sequence(row, genome):
+    chrom = row['chrom']
+    start = row['start']
+    end = row['end']
+    strand = row['strand']
+
+    if chrom not in genome:
+        print(f"⚠️ Chromosome '{chrom}' not found in genome!")
+        return None
+
+    try:
+        seq = genome[chrom][start-1:end]  # 0-based indexing
+        if strand == '-':
+            seq = str(Seq(seq).reverse_complement())
+        return seq
+    except Exception as e:
+        print(f"❌ Error extracting sequence for gene {row['gene_id']} on {chrom}:{start}-{end} — {e}")
+        return None
+
+print("🚀 Extracting sequences...")
+merged['sequence'] = merged.apply(lambda row: extract_sequence(row, genome_data), axis=1)
+
+before_drop = len(merged)
+merged.dropna(subset=['sequence'], inplace=True)
+after_drop = len(merged)
+print(f"✅ Extracted DNA sequences for {after_drop} genes (Dropped {before_drop - after_drop} missing)")
+
+# -------------------------------
+# STEP 7: Save final dataset
+# -------------------------------
+
+merged.to_csv("model.csv", index=False)
+print("📁 Final training dataset saved to 'model.csv' ✅")
